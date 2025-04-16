@@ -5,14 +5,14 @@ export default {
       const url = new URL(request.url);
       const path = url.pathname;
       const params = url.searchParams;
-      
+
       // CORS headers for all responses
       const corsHeaders = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type",
       };
-      
+
       // Handle OPTIONS requests (for CORS)
       if (request.method === "OPTIONS") {
         return new Response(null, {
@@ -20,70 +20,94 @@ export default {
           status: 204,
         });
       }
-      
+
       // Only allow GET requests
       if (request.method !== "GET") {
         return new Response(JSON.stringify({
           status: "error",
           message: "Method not allowed"
         }), {
-          headers: { 
+          headers: {
             "content-type": "application/json",
             ...corsHeaders
           },
           status: 405,
         });
       }
-      
+
+      // Fetch all necessary data from Google Sheets first
+      // We'll need this data for all endpoint operations
+      const [
+        models,
+        variants,
+        colors,
+        components,
+        pricing,
+        insuranceProviders,
+        insurancePlans,
+        financeProviders,
+        financeOptions
+      ] = await Promise.all([
+        fetchSheetData('models'),
+        fetchSheetData('variants'),
+        fetchSheetData('colors'),
+        fetchSheetData('components'),
+        fetchSheetData('pricing'),
+        fetchSheetData('insurance_providers'),
+        fetchSheetData('insurance_plans'),
+        fetchSheetData('finance_providers'),
+        fetchSheetData('finance_options')
+      ]);
+
       // Route the request to the appropriate handler
       let response;
-      
+
       if (path.match(/^\/v1\/vehicles\/?$/)) {
-        response = await getVehicles(params, env);
+        response = getVehicles(params, { models, variants, colors, components, pricing });
       } else if (path.match(/^\/v1\/vehicles\/[^\/]+\/?$/)) {
         const vehicleId = path.split('/').filter(Boolean)[2];
-        response = await getVehicleById(vehicleId, params, env);
+        response = getVehicleById(vehicleId, params, { models, variants, colors, components, pricing });
       } else if (path.match(/^\/v1\/pricing\/?$/)) {
-        response = await getPricing(params, env);
+        response = getPricing(params, { models, variants, pricing });
       } else if (path.match(/^\/v1\/insurance\/options\/?$/)) {
-        response = await getInsuranceOptions(params, env);
+        response = getInsuranceOptions(params, { models, insuranceProviders, insurancePlans });
       } else if (path.match(/^\/v1\/financing\/options\/?$/)) {
-        response = await getFinancingOptions(params, env);
+        response = getFinancingOptions(params, { models, variants, pricing, financeProviders, financeOptions });
       } else {
         // Not found
         response = new Response(JSON.stringify({
           status: "error",
           message: "Endpoint not found"
         }), {
-          headers: { 
+          headers: {
             "content-type": "application/json",
             ...corsHeaders
           },
           status: 404,
         });
       }
-      
+
       // Add CORS headers to the response
       const originalHeaders = response.headers;
       const newHeaders = new Headers(originalHeaders);
-      
+
       Object.keys(corsHeaders).forEach(key => {
         newHeaders.set(key, corsHeaders[key]);
       });
-      
+
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
         headers: newHeaders,
       });
-      
+
     } catch (err) {
       return new Response(JSON.stringify({
         status: "error",
         message: "Internal server error",
         details: process.env.NODE_ENV === 'development' ? err.message : undefined
       }), {
-        headers: { 
+        headers: {
           "content-type": "application/json",
           "Access-Control-Allow-Origin": "*"
         },
@@ -91,93 +115,145 @@ export default {
       });
     }
   },
-} satisfies ExportedHandler<Env>;
+};
+
+// Fetch data from Google Sheets
+async function fetchSheetData(sheetName) {
+  // The Google Sheets published URL
+  const sheetsUrl = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSmWYyNXHGa_SHzJt8e01Hl1xgnwqFTKp7uM4Grj2KNhQyz7_2djFbkhxAh0wZYUpiRhQAsfsZLKArd/pubhtml';
+
+  try {
+    // Fetch the HTML content
+    const response = await fetch(sheetsUrl);
+    const htmlContent = await response.text();
+
+    // Extract the table data for the specified sheet
+    // This is a simple extraction - you might need a more robust solution
+    const regex = new RegExp(`<table[^>]*id="${sheetName}"[^>]*>([\\s\\S]*?)<\\/table>`);
+    const match = htmlContent.match(regex);
+
+    if (!match) {
+      console.error(`Sheet "${sheetName}" not found`);
+      return [];
+    }
+
+    // Parse table HTML to get TSV data
+    const tableHtml = match[0];
+    return parseTableToObjects(tableHtml);
+  } catch (error) {
+    console.error(`Error fetching sheet "${sheetName}":`, error);
+    return [];
+  }
+}
+
+// Parse HTML table to JavaScript objects
+function parseTableToObjects(tableHtml) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(tableHtml, 'text/html');
+  const rows = doc.querySelectorAll('tr');
+
+  if (rows.length < 2) return []; // Need at least header + one data row
+
+  // Extract headers from first row
+  const headers = Array.from(rows[0].querySelectorAll('th, td')).map(cell =>
+    cell.textContent.trim().toLowerCase()
+  );
+
+  // Extract data rows
+  const results = [];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const cells = Array.from(row.querySelectorAll('td'));
+
+    // Skip rows with wrong number of cells
+    if (cells.length !== headers.length) continue;
+
+    const rowData = {};
+    headers.forEach((header, index) => {
+      let value = cells[index].textContent.trim();
+
+      // Convert to appropriate types
+      if (value === 'TRUE' || value === 'true') value = true;
+      else if (value === 'FALSE' || value === 'false') value = false;
+      else if (!isNaN(value) && value !== '') value = Number(value);
+
+      rowData[header] = value;
+    });
+
+    results.push(rowData);
+  }
+
+  return results;
+}
 
 // Handler functions
-async function getVehicles(params, env) {
+function getVehicles(params, data) {
+  const { models, variants, colors, components, pricing } = data;
   const locationId = params.get('location_id');
   const include = params.get('include')?.split(',') || [];
-  
+
   let includeVariants = include.includes('variants');
   let includeColors = include.includes('colors');
   let includeComponents = include.includes('components');
-  
-  // Query basic vehicle info
-  let query = `
-    SELECT 
-      m.id, 
-      m.model_code, 
-      m.name, 
-      m.description, 
-      m.image_url,
-      COALESCE(p.base_price, 0) as base_price
-    FROM models m
-    LEFT JOIN pricing p ON m.id = p.model_id AND p.pincode_start IS NULL
-  `;
-  
+
+  // Filter models by location if needed
+  let filteredModels = models;
   if (locationId) {
-    query += ` WHERE m.id IN (SELECT model_id FROM pricing WHERE state = ? OR city = ?)`;
+    const locationPricing = pricing.filter(p =>
+      p.state === locationId || p.city === locationId
+    );
+    const modelIds = locationPricing.map(p => p.model_id);
+    filteredModels = models.filter(m => modelIds.includes(m.id));
   }
-  
-  const stmt = env.DB.prepare(query);
-  let results;
-  
-  if (locationId) {
-    results = await stmt.bind(locationId, locationId).all();
-  } else {
-    results = await stmt.all();
-  }
-  
-  const vehicles = results.results || [];
-  
-  // Enhance vehicles with requested relations
-  const enhancedVehicles = [];
-  
-  for (const vehicle of vehicles) {
+
+  // Enhance vehicles with pricing and requested relations
+  const enhancedVehicles = filteredModels.map(model => {
+    // Find base price
+    const modelPricing = pricing.find(p =>
+      p.model_id === model.id && !p.pincode_start && !p.pincode_end
+    );
+
+    const basePrice = modelPricing ? modelPricing.base_price : 0;
+
     const enhancedVehicle = {
-      ...vehicle,
-      formatted_price: formatPrice(vehicle.base_price)
+      ...model,
+      base_price: basePrice,
+      formatted_price: formatPrice(basePrice)
     };
-    
+
     // Add variants if requested
     if (includeVariants) {
-      const variantsStmt = env.DB.prepare(`
-        SELECT * FROM variants WHERE model_id = ?
-      `);
-      const variantsResult = await variantsStmt.bind(vehicle.id).all();
-      enhancedVehicle.variants = (variantsResult.results || []).map(v => ({
-        ...v,
-        is_default: Boolean(v.is_default)
-      }));
+      enhancedVehicle.variants = variants
+        .filter(v => v.model_id === model.id)
+        .map(v => ({
+          ...v,
+          is_default: Boolean(v.is_default)
+        }));
     }
-    
+
     // Add colors if requested
     if (includeColors) {
-      const colorsStmt = env.DB.prepare(`
-        SELECT * FROM colors WHERE model_id = ?
-      `);
-      const colorsResult = await colorsStmt.bind(vehicle.id).all();
-      enhancedVehicle.colors = (colorsResult.results || []).map(c => ({
-        ...c,
-        is_default: Boolean(c.is_default)
-      }));
+      enhancedVehicle.colors = colors
+        .filter(c => c.model_id === model.id)
+        .map(c => ({
+          ...c,
+          is_default: Boolean(c.is_default)
+        }));
     }
-    
+
     // Add components if requested
     if (includeComponents) {
-      const componentsStmt = env.DB.prepare(`
-        SELECT * FROM components WHERE model_id = ?
-      `);
-      const componentsResult = await componentsStmt.bind(vehicle.id).all();
-      enhancedVehicle.components = (componentsResult.results || []).map(c => ({
-        ...c,
-        is_required: Boolean(c.is_required)
-      }));
+      enhancedVehicle.components = components
+        .filter(c => c.model_id === model.id)
+        .map(c => ({
+          ...c,
+          is_required: Boolean(c.is_required)
+        }));
     }
-    
-    enhancedVehicles.push(enhancedVehicle);
-  }
-  
+
+    return enhancedVehicle;
+  });
+
   return new Response(JSON.stringify({
     status: "success",
     data: {
@@ -192,30 +268,20 @@ async function getVehicles(params, env) {
   });
 }
 
-async function getVehicleById(vehicleId, params, env) {
+function getVehicleById(vehicleId, params, data) {
+  const { models, variants, colors, components, pricing } = data;
   const include = params.get('include')?.split(',') || [];
-  
+
   let includeVariants = include.includes('variants');
   let includeColors = include.includes('colors');
   let includeComponents = include.includes('components');
-  
-  // Query vehicle by ID or model_code
-  const vehicleStmt = env.DB.prepare(`
-    SELECT 
-      m.id, 
-      m.model_code, 
-      m.name, 
-      m.description, 
-      m.image_url,
-      COALESCE(p.base_price, 0) as base_price
-    FROM models m
-    LEFT JOIN pricing p ON m.id = p.model_id AND p.pincode_start IS NULL
-    WHERE m.id = ? OR m.model_code = ?
-  `);
-  
-  const vehicleResult = await vehicleStmt.bind(vehicleId, vehicleId).all();
-  
-  if (!vehicleResult.results || vehicleResult.results.length === 0) {
+
+  // Find vehicle by ID or model_code
+  const vehicle = models.find(m =>
+    m.id.toString() === vehicleId || m.model_code === vehicleId
+  );
+
+  if (!vehicle) {
     return new Response(JSON.stringify({
       status: "error",
       message: "Vehicle not found"
@@ -224,49 +290,50 @@ async function getVehicleById(vehicleId, params, env) {
       status: 404,
     });
   }
-  
-  const vehicle = vehicleResult.results[0];
+
+  // Find base price
+  const modelPricing = pricing.find(p =>
+    p.model_id === vehicle.id && !p.pincode_start && !p.pincode_end
+  );
+
+  const basePrice = modelPricing ? modelPricing.base_price : 0;
+
   const enhancedVehicle = {
     ...vehicle,
-    formatted_price: formatPrice(vehicle.base_price)
+    base_price: basePrice,
+    formatted_price: formatPrice(basePrice)
   };
-  
+
   // Add variants if requested
   if (includeVariants) {
-    const variantsStmt = env.DB.prepare(`
-      SELECT * FROM variants WHERE model_id = ?
-    `);
-    const variantsResult = await variantsStmt.bind(vehicle.id).all();
-    enhancedVehicle.variants = (variantsResult.results || []).map(v => ({
-      ...v,
-      is_default: Boolean(v.is_default)
-    }));
+    enhancedVehicle.variants = variants
+      .filter(v => v.model_id === vehicle.id)
+      .map(v => ({
+        ...v,
+        is_default: Boolean(v.is_default)
+      }));
   }
-  
+
   // Add colors if requested
   if (includeColors) {
-    const colorsStmt = env.DB.prepare(`
-      SELECT * FROM colors WHERE model_id = ?
-    `);
-    const colorsResult = await colorsStmt.bind(vehicle.id).all();
-    enhancedVehicle.colors = (colorsResult.results || []).map(c => ({
-      ...c,
-      is_default: Boolean(c.is_default)
-    }));
+    enhancedVehicle.colors = colors
+      .filter(c => c.model_id === vehicle.id)
+      .map(c => ({
+        ...c,
+        is_default: Boolean(c.is_default)
+      }));
   }
-  
+
   // Add components if requested
   if (includeComponents) {
-    const componentsStmt = env.DB.prepare(`
-      SELECT * FROM components WHERE model_id = ?
-    `);
-    const componentsResult = await componentsStmt.bind(vehicle.id).all();
-    enhancedVehicle.components = (componentsResult.results || []).map(c => ({
-      ...c,
-      is_required: Boolean(c.is_required)
-    }));
+    enhancedVehicle.components = components
+      .filter(c => c.model_id === vehicle.id)
+      .map(c => ({
+        ...c,
+        is_required: Boolean(c.is_required)
+      }));
   }
-  
+
   return new Response(JSON.stringify({
     status: "success",
     data: {
@@ -278,11 +345,12 @@ async function getVehicleById(vehicleId, params, env) {
   });
 }
 
-async function getPricing(params, env) {
+function getPricing(params, data) {
+  const { models, variants, pricing } = data;
   const vehicleId = params.get('vehicle_id');
   const variantId = params.get('variant_id');
   const locationCode = params.get('location_code');
-  
+
   if (!vehicleId) {
     return new Response(JSON.stringify({
       status: "error",
@@ -292,15 +360,13 @@ async function getPricing(params, env) {
       status: 400,
     });
   }
-  
-  // Get the vehicle ID from model_code
-  const vehicleStmt = env.DB.prepare(`
-    SELECT id FROM models WHERE id = ? OR model_code = ?
-  `);
-  
-  const vehicleResult = await vehicleStmt.bind(vehicleId, vehicleId).all();
-  
-  if (!vehicleResult.results || vehicleResult.results.length === 0) {
+
+  // Find vehicle by ID or model_code
+  const vehicle = models.find(m =>
+    m.id.toString() === vehicleId || m.model_code === vehicleId
+  );
+
+  if (!vehicle) {
     return new Response(JSON.stringify({
       status: "error",
       message: "Vehicle not found"
@@ -309,20 +375,13 @@ async function getPricing(params, env) {
       status: 404,
     });
   }
-  
-  const modelId = vehicleResult.results[0].id;
-  
+
   // Get base pricing
-  let pricingQuery = `
-    SELECT base_price, fulfillment_fee
-    FROM pricing
-    WHERE model_id = ? AND pincode_start IS NULL
-  `;
-  
-  let pricingStmt = env.DB.prepare(pricingQuery);
-  let pricingResult = await pricingStmt.bind(modelId).all();
-  
-  if (!pricingResult.results || pricingResult.results.length === 0) {
+  let basePricing = pricing.find(p =>
+    p.model_id === vehicle.id && !p.pincode_start && !p.pincode_end
+  );
+
+  if (!basePricing) {
     return new Response(JSON.stringify({
       status: "error",
       message: "Pricing not found for this vehicle"
@@ -331,59 +390,49 @@ async function getPricing(params, env) {
       status: 404,
     });
   }
-  
-  let pricing = pricingResult.results[0];
+
+  let pricingData = basePricing;
   let locationSpecific = false;
-  
+
   // Check for location-specific pricing
   if (locationCode && /^\d{6}$/.test(locationCode)) {
-    let locationQuery = `
-      SELECT base_price, fulfillment_fee
-      FROM pricing
-      WHERE model_id = ? AND ? BETWEEN pincode_start AND pincode_end
-    `;
-    
-    let locationStmt = env.DB.prepare(locationQuery);
-    let locationResult = await locationStmt.bind(modelId, parseInt(locationCode)).all();
-    
-    if (locationResult.results && locationResult.results.length > 0) {
-      pricing = locationResult.results[0];
+    const locationPricing = pricing.find(p =>
+      p.model_id === vehicle.id &&
+      parseInt(locationCode) >= p.pincode_start &&
+      parseInt(locationCode) <= p.pincode_end
+    );
+
+    if (locationPricing) {
+      pricingData = locationPricing;
       locationSpecific = true;
     }
   }
-  
+
   // Get variant pricing
-  const variantsStmt = env.DB.prepare(`
-    SELECT code as variant_id, price_addition
-    FROM variants
-    WHERE model_id = ?
-  `);
-  
-  const variantsResult = await variantsStmt.bind(modelId).all();
-  const variants = variantsResult.results || [];
-  
-  const variantPricing = variants.map(v => {
-    const totalPrice = pricing.base_price + v.price_addition + (pricing.fulfillment_fee || 0);
+  const modelVariants = variants.filter(v => v.model_id === vehicle.id);
+
+  const variantPricing = modelVariants.map(v => {
+    const totalPrice = pricingData.base_price + v.price_addition + (pricingData.fulfillment_fee || 0);
     return {
-      variant_id: v.variant_id,
+      variant_id: v.code,
       price_addition: v.price_addition,
       formatted_price_addition: formatPrice(v.price_addition),
       total_price: totalPrice,
       formatted_total_price: formatPrice(totalPrice)
     };
   });
-  
-  const baseTotal = pricing.base_price + (pricing.fulfillment_fee || 0);
-  
+
+  const baseTotal = pricingData.base_price + (pricingData.fulfillment_fee || 0);
+
   return new Response(JSON.stringify({
     status: "success",
     data: {
       pricing: {
         vehicle_id: vehicleId,
-        base_price: pricing.base_price,
-        formatted_base_price: formatPrice(pricing.base_price),
-        fulfillment_fee: pricing.fulfillment_fee || 0,
-        formatted_fulfillment_fee: formatPrice(pricing.fulfillment_fee || 0),
+        base_price: pricingData.base_price,
+        formatted_base_price: formatPrice(pricingData.base_price),
+        fulfillment_fee: pricingData.fulfillment_fee || 0,
+        formatted_fulfillment_fee: formatPrice(pricingData.fulfillment_fee || 0),
         total_price: baseTotal,
         formatted_total_price: formatPrice(baseTotal),
         location_specific: locationSpecific,
@@ -396,46 +445,28 @@ async function getPricing(params, env) {
   });
 }
 
-async function getInsuranceOptions(params, env) {
+function getInsuranceOptions(params, data) {
+  const { models, insuranceProviders, insurancePlans } = data;
   const vehicleId = params.get('vehicle_id');
-  
-  // Get tenures (hardcoded for now, but could come from database)
+
+  // Get tenures (hardcoded for now, but could extract from plans)
   const tenures = [
     { id: "1year", name: "01 Year", months: 12 },
     { id: "5years", name: "05 Years", months: 60 }
   ];
-  
+
   // Get providers
-  const providersStmt = env.DB.prepare(`
-    SELECT id, name, logo_url FROM insurance_providers
-  `);
-  
-  const providersResult = await providersStmt.all();
-  const providers = providersResult.results || [];
-  
+  const providers = insuranceProviders;
+
   // Get insurance plans
-  let plansQuery = `
-    SELECT 
-      ip.id, 
-      ip.provider_id, 
-      ip.plan_type, 
-      ip.title, 
-      ip.subtitle, 
-      ip.description, 
-      ip.price, 
-      ip.is_required, 
-      ip.tenure_months
-    FROM insurance_plans ip
-  `;
-  
+  let plans = insurancePlans;
+
   if (vehicleId) {
     // Add vehicle-specific filtering logic here if needed
+    // For now, we just return all plans as the data model doesn't show
+    // a relationship between vehicles and specific insurance plans
   }
-  
-  const plansStmt = env.DB.prepare(plansQuery);
-  const plansResult = await plansStmt.all();
-  const plans = plansResult.results || [];
-  
+
   // Separate core and additional plans
   const corePlans = plans
     .filter(p => p.plan_type === 'CORE')
@@ -444,7 +475,7 @@ async function getInsuranceOptions(params, env) {
       formatted_price: formatPrice(p.price),
       is_required: Boolean(p.is_required)
     }));
-  
+
   const additionalPlans = plans
     .filter(p => p.plan_type === 'ADDITIONAL')
     .map(p => ({
@@ -452,7 +483,7 @@ async function getInsuranceOptions(params, env) {
       formatted_price: formatPrice(p.price),
       is_required: Boolean(p.is_required)
     }));
-  
+
   return new Response(JSON.stringify({
     status: "success",
     data: {
@@ -469,11 +500,12 @@ async function getInsuranceOptions(params, env) {
   });
 }
 
-async function getFinancingOptions(params, env) {
+function getFinancingOptions(params, data) {
+  const { models, variants, pricing, financeProviders, financeOptions } = data;
   const vehicleId = params.get('vehicle_id');
   const variantId = params.get('variant_id');
   const amount = parseInt(params.get('amount') || '0');
-  
+
   if (!vehicleId && !amount) {
     return new Response(JSON.stringify({
       status: "error",
@@ -483,22 +515,17 @@ async function getFinancingOptions(params, env) {
       status: 400,
     });
   }
-  
+
   // Calculate financing amount based on vehicle/variant or use provided amount
   let financingAmount = amount;
-  
+
   if (vehicleId && !amount) {
-    // Get vehicle price
-    const vehicleStmt = env.DB.prepare(`
-      SELECT m.id, p.base_price
-      FROM models m
-      JOIN pricing p ON m.id = p.model_id AND p.pincode_start IS NULL
-      WHERE m.id = ? OR m.model_code = ?
-    `);
-    
-    const vehicleResult = await vehicleStmt.bind(vehicleId, vehicleId).all();
-    
-    if (!vehicleResult.results || vehicleResult.results.length === 0) {
+    // Find vehicle by ID or model_code
+    const vehicle = models.find(m =>
+      m.id.toString() === vehicleId || m.model_code === vehicleId
+    );
+
+    if (!vehicle) {
       return new Response(JSON.stringify({
         status: "error",
         message: "Vehicle not found"
@@ -507,60 +534,50 @@ async function getFinancingOptions(params, env) {
         status: 404,
       });
     }
-    
-    const modelId = vehicleResult.results[0].id;
-    financingAmount = vehicleResult.results[0].base_price;
-    
+
+    // Get base price
+    const basePricing = pricing.find(p =>
+      p.model_id === vehicle.id && !p.pincode_start && !p.pincode_end
+    );
+
+    if (!basePricing) {
+      return new Response(JSON.stringify({
+        status: "error",
+        message: "Pricing not found for this vehicle"
+      }), {
+        headers: { "content-type": "application/json" },
+        status: 404,
+      });
+    }
+
+    financingAmount = basePricing.base_price;
+
     // Add variant price if specified
     if (variantId) {
-      const variantStmt = env.DB.prepare(`
-        SELECT price_addition FROM variants 
-        WHERE model_id = ? AND code = ?
-      `);
-      
-      const variantResult = await variantStmt.bind(modelId, variantId).all();
-      
-      if (variantResult.results && variantResult.results.length > 0) {
-        financingAmount += variantResult.results[0].price_addition;
+      const variant = variants.find(v =>
+        v.model_id === vehicle.id && v.code === variantId
+      );
+
+      if (variant) {
+        financingAmount += variant.price_addition;
       }
     }
   }
-  
+
   // Get providers
-  const providersStmt = env.DB.prepare(`
-    SELECT id, name, logo_url FROM finance_providers
-  `);
-  
-  const providersResult = await providersStmt.all();
-  const providers = providersResult.results || [];
-  
-  // Get financing options
-  const optionsStmt = env.DB.prepare(`
-    SELECT 
-      id, 
-      provider_id, 
-      name, 
-      tenure_months, 
-      interest_rate, 
-      min_downpayment, 
-      processing_fee
-    FROM finance_options
-  `);
-  
-  const optionsResult = await optionsStmt.all();
-  let options = optionsResult.results || [];
-  
-  // Calculate EMI for each option
-  options = options.map(option => {
+  const providers = financeProviders;
+
+  // Get financing options and calculate EMI
+  let options = financeOptions.map(option => {
     // Simple EMI calculation
     const loanAmount = financingAmount - option.min_downpayment;
     const monthlyInterestRate = option.interest_rate / (12 * 100);
     const emi = Math.round(
-      loanAmount * monthlyInterestRate * 
-      Math.pow(1 + monthlyInterestRate, option.tenure_months) / 
+      loanAmount * monthlyInterestRate *
+      Math.pow(1 + monthlyInterestRate, option.tenure_months) /
       (Math.pow(1 + monthlyInterestRate, option.tenure_months) - 1)
     );
-    
+
     return {
       ...option,
       formatted_min_downpayment: formatPrice(option.min_downpayment),
@@ -569,7 +586,7 @@ async function getFinancingOptions(params, env) {
       formatted_monthly_emi: formatPrice(emi)
     };
   });
-  
+
   return new Response(JSON.stringify({
     status: "success",
     data: {
