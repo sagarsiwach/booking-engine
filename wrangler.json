@@ -1,16 +1,9 @@
 {
-  "compatibility_date": "2025-04-01",
-  "main": "src/index.ts",
-  "name": "booking-engine",
-  "upload_source_maps": true,
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_id": "4a268087-4a75-40f2-9c57-24febdc3a628",
-      "database_name": "km_booking"
+    "compatibility_date": "2025-04-01",
+    "main": "src/index.ts",
+    "name": "booking-engine",
+    "upload_source_maps": true,
+    "observability": {
+        "enabled": true
     }
-  ],
-  "observability": {
-    "enabled": true
-  }
 }

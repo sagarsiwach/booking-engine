@@ -1,9 +1,26 @@
 // src/index.ts
+
+// Configuration
+const CONFIG = {
+  API_ENDPOINT: "https://automation.unipack.asia/webhook/kabira/booking/",
+  DEBUG_ENDPOINT: "https://automation.unipack.asia/webhook-test/kabira/booking/",
+  CACHE_DURATION: 30 * 60 * 1000, // 30 minutes in milliseconds
+};
+
+// Cache management
+interface CacheEntry {
+  timestamp: number;
+  data: any;
+}
+
+let dataCache: CacheEntry | null = null;
+
 export default {
-  async fetch(request, env) {
+  async fetch(request) {
     try {
       const url = new URL(request.url);
       const path = url.pathname;
+      const isDebug = path.includes('/debug');
 
       // CORS headers for all responses
       const corsHeaders = {
@@ -20,15 +37,49 @@ export default {
         });
       }
 
-      // We'll just have a single endpoint for all data
-      if (path === "/" || path === "") {
-        // Fetch all sheet data
-        const allData = await fetchAllSheetsData();
+      // Main endpoint for all data
+      if (path === "/" || path === "/debug" || path === "") {
+        console.log(`Fetching data in ${isDebug ? 'debug' : 'normal'} mode...`);
 
-        return new Response(JSON.stringify({
-          status: "success",
-          data: allData
-        }), {
+        // Check if we have cached data and it's still valid
+        const now = Date.now();
+        let data;
+        let fromCache = false;
+
+        if (dataCache && (now - dataCache.timestamp) < CONFIG.CACHE_DURATION && !isDebug) {
+          console.log("Using cached data");
+          data = dataCache.data;
+          fromCache = true;
+        } else {
+          console.log("Fetching fresh data from API");
+          data = await fetchDataFromAPI(isDebug);
+
+          // Store in cache if not in debug mode
+          if (!isDebug) {
+            dataCache = {
+              timestamp: now,
+              data: data
+            };
+          }
+        }
+
+        // Include cache information in debug mode
+        const responseBody = isDebug
+          ? {
+            status: "success",
+            debug: {
+              fromCache,
+              cacheAge: fromCache ? Math.round((now - dataCache!.timestamp) / 1000) + " seconds" : null,
+              endpoint: isDebug ? CONFIG.DEBUG_ENDPOINT : CONFIG.API_ENDPOINT,
+            },
+            data
+          }
+          : {
+            status: "success",
+            data
+          };
+
+        return new Response(JSON.stringify(responseBody, null, isDebug ? 2 : 0), {
           headers: {
             "content-type": "application/json",
             ...corsHeaders
@@ -50,6 +101,7 @@ export default {
       }
 
     } catch (err) {
+      console.error("Error in request handler:", err);
       return new Response(JSON.stringify({
         status: "error",
         message: "Internal server error",
@@ -65,104 +117,75 @@ export default {
   },
 };
 
-// Fetch all sheets data from the CSV
-async function fetchAllSheetsData() {
-  const baseUrl = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSmWYyNXHGa_SHzJt8e01Hl1xgnwqFTKp7uM4Grj2KNhQyz7_2djFbkhxAh0wZYUpiRhQAsfsZLKArd/pub";
-  const sheets = [
-    'models',
-    'variants',
-    'colors',
-    'components',
-    'pricing',
-    'insurance_providers',
-    'insurance_plans',
-    'finance_providers',
-    'finance_options'
-  ];
+async function fetchDataFromAPI(isDebug: boolean): Promise<any> {
+  try {
+    const endpoint = isDebug ? CONFIG.DEBUG_ENDPOINT : CONFIG.API_ENDPOINT;
+    console.log(`Fetching data from: ${endpoint}`);
 
-  const dataPromises = sheets.map(async (sheetName) => {
-    const sheetUrl = `${baseUrl}?gid=0&single=true&output=csv&sheet=${encodeURIComponent(sheetName)}`;
-    try {
-      const response = await fetch(sheetUrl);
+    const startTime = Date.now();
+    const response = await fetch(endpoint);
+    const endTime = Date.now();
 
-      if (!response.ok) {
-        console.error(`Failed to fetch sheet ${sheetName}: ${response.status}`);
-        return { [sheetName]: [] };
-      }
-
-      const csvText = await response.text();
-      const data = parseCSV(csvText);
-      return { [sheetName]: data };
-    } catch (error) {
-      console.error(`Error processing sheet ${sheetName}:`, error);
-      return { [sheetName]: [] };
-    }
-  });
-
-  const results = await Promise.all(dataPromises);
-
-  // Merge all sheet data into a single object
-  return results.reduce((acc, result) => ({ ...acc, ...result }), {});
-}
-
-// Parse CSV to array of objects
-function parseCSV(csvText) {
-  const lines = csvText.split('\n');
-  if (lines.length < 2) return [];
-
-  const headers = parseCSVRow(lines[0]).map(header => header.toLowerCase());
-  const results = [];
-
-  for (let i = 1; i < lines.length; i++) {
-    if (!lines[i].trim()) continue;
-
-    const values = parseCSVRow(lines[i]);
-    if (values.length !== headers.length) continue;
-
-    const obj = {};
-    for (let j = 0; j < headers.length; j++) {
-      let value = values[j];
-
-      // Convert to appropriate types
-      if (value === 'TRUE' || value === 'true') value = true;
-      else if (value === 'FALSE' || value === 'false') value = false;
-      else if (!isNaN(value) && value !== '') value = Number(value);
-
-      obj[headers[j]] = value;
+    if (!response.ok) {
+      console.error(`Failed to fetch data: ${response.status} ${response.statusText}`);
+      throw new Error(`API responded with status: ${response.status}`);
     }
 
-    results.push(obj);
+    const data = await response.json();
+    console.log(`Data fetched successfully in ${endTime - startTime}ms`);
+
+    // Process the data to organize it by tables
+    return processData(data);
+  } catch (error) {
+    console.error("Error fetching data:", error);
+    throw error;
   }
-
-  return results;
 }
 
-// Parse a CSV row, handling quoted fields
-function parseCSVRow(row) {
-  const values = [];
-  let inQuotes = false;
-  let currentValue = '';
+function processData(rawData: any[]): Record<string, any[]> {
+  // Initialize tables
+  const tables: Record<string, any[]> = {
+    models: [],
+    variants: [],
+    colors: [],
+    components: [],
+    pricing: [],
+    insurance_providers: [],
+    insurance_plans: [],
+    finance_providers: [],
+    finance_options: []
+  };
 
-  for (let i = 0; i < row.length; i++) {
-    const char = row[i];
+  // Given your sample data structure, we need to distinguish records by their fields
+  // This is a heuristic approach based on the data you provided
+  for (const item of rawData) {
+    // Skip row_number field from the output
+    const { row_number, ...cleanedItem } = item;
 
-    if (char === '"') {
-      // Handle escaped quotes (two double quotes in sequence)
-      if (i + 1 < row.length && row[i + 1] === '"') {
-        currentValue += '"';
-        i++; // Skip the next quote
+    // Classify based on properties
+    if (item.model_code && !item.model_id) {
+      tables.models.push(cleanedItem);
+    } else if (item.battery_capacity && item.range_km) {
+      tables.variants.push(cleanedItem);
+    } else if (item.color_value) {
+      tables.colors.push(cleanedItem);
+    } else if (item.component_type) {
+      tables.components.push(cleanedItem);
+    } else if (item.pincode_start && item.pincode_end) {
+      tables.pricing.push(cleanedItem);
+    } else if (item.logo_url && !item.provider_id && !item.plan_type && !item.interest_rate) {
+      // This could be either insurance or finance provider
+      if (item.name.includes("BANK")) {
+        tables.finance_providers.push(cleanedItem);
       } else {
-        inQuotes = !inQuotes;
+        tables.insurance_providers.push(cleanedItem);
       }
-    } else if (char === ',' && !inQuotes) {
-      values.push(currentValue);
-      currentValue = '';
-    } else {
-      currentValue += char;
+    } else if (item.plan_type) {
+      tables.insurance_plans.push(cleanedItem);
+    } else if (item.interest_rate) {
+      tables.finance_options.push(cleanedItem);
     }
   }
 
-  // Add the last value
-  values.push(currentValue);
-  return values;
+  return tables;
 }
