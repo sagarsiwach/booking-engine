@@ -222,3 +222,51 @@ async function fetchDataFromAPI(isDebug: boolean): Promise<any> {
     throw error;
   }
 }
+
+function processData(rawData: any[]): Record<string, any[]> {
+  // Initialize tables
+  const tables: Record<string, any[]> = {
+    models: [],
+    variants: [],
+    colors: [],
+    components: [],
+    pricing: [],
+    insurance_providers: [],
+    insurance_plans: [],
+    finance_providers: [],
+    finance_options: []
+  };
+
+  // Given your sample data structure, we need to distinguish records by their fields
+  // This is a heuristic approach based on the data you provided
+  for (const item of rawData) {
+    // Skip row_number field from the output
+    const { row_number, ...cleanedItem } = item;
+
+    // Classify based on properties
+    if (item.model_code && !item.model_id) {
+      tables.models.push(cleanedItem);
+    } else if (item.battery_capacity && item.range_km) {
+      tables.variants.push(cleanedItem);
+    } else if (item.color_value) {
+      tables.colors.push(cleanedItem);
+    } else if (item.component_type) {
+      tables.components.push(cleanedItem);
+    } else if (item.pincode_start && item.pincode_end) {
+      tables.pricing.push(cleanedItem);
+    } else if (item.logo_url && !item.provider_id && !item.plan_type && !item.interest_rate) {
+      // This could be either insurance or finance provider
+      if (item.name.includes("BANK")) {
+        tables.finance_providers.push(cleanedItem);
+      } else {
+        tables.insurance_providers.push(cleanedItem);
+      }
+    } else if (item.plan_type) {
+      tables.insurance_plans.push(cleanedItem);
+    } else if (item.interest_rate) {
+      tables.finance_options.push(cleanedItem);
+    }
+  }
+
+  return tables;
+}
